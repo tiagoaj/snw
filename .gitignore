@@ -1,0 +1,31 @@
+# Dependências
+node_modules/
+frontend/node_modules/
+
+# Builds
+dist/
+frontend/dist/
+
+# Segredos e ambientes locais
+.env
+.env.*
+!.env.example
+!frontend/.env.example
+
+# Logs e arquivos temporários
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+.cache/
+tmp/
+temp/
+
+# Editores e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
