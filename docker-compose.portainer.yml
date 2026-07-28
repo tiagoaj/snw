@@ -84,7 +84,7 @@ services:
         - "traefik.http.routers.snw.rule=Host(`${SNW_DOMAIN:-snw.fluinow.com.br}`)"
         - "traefik.http.routers.snw.entrypoints=${TRAEFIK_HTTPS_ENTRYPOINT:-websecure}"
         - "traefik.http.routers.snw.tls=true"
-        - "traefik.http.routers.snw.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+        - "traefik.http.routers.snw.tls.certresolver=le"
         - "traefik.http.routers.snw-http.rule=Host(`${SNW_DOMAIN:-snw.fluinow.com.br}`)"
         - "traefik.http.routers.snw-http.entrypoints=${TRAEFIK_HTTP_ENTRYPOINT:-web}"
         - "traefik.http.routers.snw-http.middlewares=snw-redirect-https"

@@ -71,7 +71,6 @@ SNW_DOMAIN=snw.fluinow.com.br
 TRAEFIK_NETWORK=traefik-public
 TRAEFIK_HTTP_ENTRYPOINT=web
 TRAEFIK_HTTPS_ENTRYPOINT=websecure
-TRAEFIK_CERT_RESOLVER=letsencrypt
 SNW_IMAGE_TAG=latest
 ```
 
@@ -124,11 +123,8 @@ Se a rede se chamar `proxy`, use:
 TRAEFIK_NETWORK=proxy
 ```
 
-Se o resolver se chamar `cloudflare`, use:
-
-```env
-TRAEFIK_CERT_RESOLVER=cloudflare
-```
+O resolver desta infraestrutura está definido como `le` diretamente nas labels
+da Stack.
 
 ## 7. Configurar o Supabase
 
