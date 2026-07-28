@@ -69,7 +69,29 @@ const providerLogoPath = {
 }
 
 function LandingPage({ onLogin, onTrial }: { onLogin: () => void; onTrial: (plan?: PlanId) => void }) {
-  const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' })
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const scrollTo = (id: string) => {
+    setMobileMenuOpen(false)
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' })
+  }
+  const openLogin = () => {
+    setMobileMenuOpen(false)
+    onLogin()
+  }
+  const openTrial = () => {
+    setMobileMenuOpen(false)
+    onTrial()
+  }
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileMenuOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [mobileMenuOpen])
+
   return (
     <div className="landing">
       <header className="landing-nav">
@@ -83,9 +105,32 @@ function LandingPage({ onLogin, onTrial }: { onLogin: () => void; onTrial: (plan
           <button type="button" onClick={() => scrollTo('planos')}>Planos</button>
         </nav>
         <div className="landing-nav-actions">
-          <button className="landing-login" type="button" onClick={onLogin}>Entrar</button>
-          <button className="landing-cta compact" type="button" onClick={() => onTrial()}>Testar grátis</button>
+          <button className="landing-login" type="button" onClick={openLogin}>Entrar</button>
+          <button className="landing-cta compact" type="button" onClick={openTrial}>Testar grátis</button>
+          <button
+            className={`landing-menu-toggle ${mobileMenuOpen ? 'open' : ''}`}
+            type="button"
+            aria-label={mobileMenuOpen ? 'Fechar menu' : 'Abrir menu'}
+            aria-expanded={mobileMenuOpen}
+            aria-controls="landing-mobile-menu"
+            onClick={() => setMobileMenuOpen((open) => !open)}
+          >
+            <span />
+            <span />
+            <span />
+          </button>
         </div>
+        <nav
+          className={`landing-mobile-menu ${mobileMenuOpen ? 'open' : ''}`}
+          id="landing-mobile-menu"
+          aria-label="Navegação mobile"
+          aria-hidden={!mobileMenuOpen}
+        >
+          <button type="button" onClick={() => scrollTo('recursos')}>Recursos</button>
+          <button type="button" onClick={() => scrollTo('como-funciona')}>Como funciona</button>
+          <button type="button" onClick={() => scrollTo('planos')}>Planos</button>
+          <button className="mobile-login-link" type="button" onClick={openLogin}>Entrar na minha conta</button>
+        </nav>
       </header>
 
       <main>
