@@ -143,7 +143,7 @@ tbody tr:hover, .selected-row { background: #10231e; }
 .landing-nav nav button, .landing-login, .landing-footer button { min-height: 0; padding: 8px 0; border-radius: 0; background: transparent; color: #9aada7; font-size: 12px; font-weight: 700; }
 .landing-nav nav button:hover, .landing-login:hover, .landing-footer button:hover { color: #68efbb; }
 .landing-nav-actions { justify-self: end; display: flex; align-items: center; gap: 18px; }
-.landing-menu-toggle, .landing-mobile-menu { display: none; }
+.landing-menu-toggle, .landing-nav .landing-mobile-menu { display: none; }
 .landing-cta { display: inline-flex; align-items: center; justify-content: center; gap: 16px; min-height: 50px; padding: 0 21px; border: 1px solid #54efb2; border-radius: 11px; background: #54efb2; color: #062117; box-shadow: 0 12px 35px rgba(55, 230, 161, .16); font-size: 13px; font-weight: 900; }
 .landing-cta:hover { background: #72f5c2; box-shadow: 0 15px 40px rgba(55, 230, 161, .25); }
 .landing-cta.compact { min-height: 38px; padding: 0 15px; font-size: 11px; }
