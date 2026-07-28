@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+frontend/node_modules
+dist
+frontend/dist
+*.log
+.vscode
+.idea
+docs
+supabase

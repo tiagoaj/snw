@@ -39,3 +39,8 @@ Depois que o Supabase estiver configurado, podemos criar:
 - painel de seleção de plataforma
 - evento de desconexão e geração de QR Code
 - notificações por e-mail e WhatsApp
+
+## Produção com Portainer
+
+Para publicar o painel e a API em uma Stack Docker, siga
+[docs/DEPLOY-PORTAINER.md](docs/DEPLOY-PORTAINER.md).
