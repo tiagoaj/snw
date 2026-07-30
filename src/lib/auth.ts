@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from 'express'
 import { timingSafeEqual } from 'crypto'
 import { supabaseAdmin } from './supabaseClient.js'
+import { workspaceBillingAccess } from './billingAccessService.js'
 
 export interface AuthRequest extends Request {
   currentUser?: any
@@ -87,6 +88,22 @@ export async function ensureWorkspaceAccess(req: AuthRequest, workspaceId: strin
   return req.currentUserProfiles.some(
     (profile) => profile.workspace_id === workspaceId && ['workspace_admin', 'superadmin'].includes(profile.role)
   )
+}
+
+export async function ensureWorkspaceOperationalAccess(
+  req: AuthRequest,
+  res: Response,
+  workspaceId: string
+) {
+  if (req.currentUserRow?.role === 'superadmin') return true
+  const access = await workspaceBillingAccess(workspaceId)
+  if (access.operational_allowed) return true
+  res.status(402).json({
+    error: 'Workspace suspenso por pendência financeira. Regularize o pagamento para reativar a operação.',
+    code: 'BILLING_BLOCKED',
+    billing_access: access
+  })
+  return false
 }
 
 export function requireWebhookSecret(req: Request, res: Response, next: NextFunction) {

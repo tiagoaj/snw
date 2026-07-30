@@ -53,6 +53,11 @@ async function monitorNumber(number: any) {
       return
     }
 
+    if (providerResult.status === 'pending') {
+      await updateWhatsappNumber(number.id, { last_checked_at: checkedAt })
+      return
+    }
+
     const failures = (number.consecutive_failures || 0) + 1
     await updateWhatsappNumber(number.id, {
       last_checked_at: checkedAt,

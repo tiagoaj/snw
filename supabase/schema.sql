@@ -233,3 +233,58 @@ DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at
 BEFORE UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Assinatura mensal do workspace. Valores são definidos pelo backend e armazenados
+-- em centavos para evitar arredondamentos.
+CREATE TABLE IF NOT EXISTS workspace_subscriptions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+  provider text NOT NULL DEFAULT 'asaas' CHECK (provider = 'asaas'),
+  plan_id text NOT NULL CHECK (plan_id IN ('start', 'growth', 'scale')),
+  integration_limit integer NOT NULL CHECK (integration_limit BETWEEN 1 AND 3),
+  amount_cents integer NOT NULL CHECK (amount_cents > 0),
+  status text NOT NULL DEFAULT 'trialing'
+    CHECK (status IN ('trialing', 'checkout_pending', 'active', 'past_due', 'canceled', 'expired')),
+  trial_started_at timestamptz,
+  trial_ends_at timestamptz,
+  asaas_checkout_id text UNIQUE,
+  asaas_checkout_url text,
+  checkout_expires_at timestamptz,
+  asaas_customer_id text,
+  asaas_subscription_id text UNIQUE,
+  asaas_last_payment_id text,
+  last_payment_status text,
+  next_due_date date,
+  last_error text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS workspace_subscriptions_customer_idx
+  ON workspace_subscriptions(asaas_customer_id);
+
+-- O Asaas pode reenviar um mesmo evento. A chave única garante idempotência.
+CREATE TABLE IF NOT EXISTS billing_webhook_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider text NOT NULL DEFAULT 'asaas' CHECK (provider = 'asaas'),
+  event_id text NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  processed_at timestamptz,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(provider, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS billing_webhook_events_created_idx
+  ON billing_webhook_events(created_at DESC);
+
+DROP TRIGGER IF EXISTS update_workspace_subscriptions_updated_at ON workspace_subscriptions;
+CREATE TRIGGER update_workspace_subscriptions_updated_at
+BEFORE UPDATE ON workspace_subscriptions
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Estas tabelas são acessadas apenas pelo backend com a service role.
+ALTER TABLE workspace_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE billing_webhook_events ENABLE ROW LEVEL SECURITY;

@@ -1,5 +1,17 @@
 # SNW Whatsapp Notification
 
+## Pagamentos
+
+A integração de assinaturas mensais com o Asaas está documentada em
+[`docs/ASAAS.md`](docs/ASAAS.md). Faça a validação no Sandbox antes de trocar
+para a chave de produção.
+
+## E-mails
+
+Alertas, cobrança, recuperação de checkout, autenticação e campanhas com Resend
+estão documentados em [`docs/RESEND.md`](docs/RESEND.md). Antes do deploy,
+execute também `supabase/email-system.sql`.
+
 Projeto inicial para plataforma de monitoramento de números WhatsApp integrada a UAZAPI, Evolution e Waha.
 
 ## Estrutura Supabase

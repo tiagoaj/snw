@@ -1,6 +1,13 @@
 import { Router } from 'express'
 import { supabaseAdmin } from './supabaseClient.js'
-import { requireAuth, requireRole, requireWebhookSecret, AuthRequest, ensureWorkspaceAccess } from './auth.js'
+import {
+  requireAuth,
+  requireRole,
+  requireWebhookSecret,
+  AuthRequest,
+  ensureWorkspaceAccess,
+  ensureWorkspaceOperationalAccess
+} from './auth.js'
 import {
   createDisconnectNotification,
   insertEvent,
@@ -14,13 +21,134 @@ import { publicIntegration, syncIntegration } from './integrationService.js'
 import {
   normalizeIncomingProviderMessage,
   processIncomingProviderMessage,
-  processSyncedTransition
+  processSyncedTransition,
+  sendManualReconnectAuthentication
 } from './syncedNotificationService.js'
+import { ensureWorkspaceSubscription, planForIntegrationCount } from './billingService.js'
+import { workspaceBillingAccess } from './billingAccessService.js'
+import { sendEmail } from './emailService.js'
 
 const router = Router()
 
 function publicClient(client: any) {
   return { ...client, integration_config: publicIntegrationConfig(client.integration_config) }
+}
+
+type ProviderConnectionStatus = 'connected' | 'disconnected' | 'pending' | 'error'
+
+function normalizedWebhookEvent(body: any) {
+  return String(
+    body.EventType ??
+    body.eventType ??
+    body.event_type ??
+    body.event ??
+    body.type ??
+    body.payload?.EventType ??
+    body.payload?.event ??
+    body.data?.EventType ??
+    body.data?.event ??
+    ''
+  ).trim().toLowerCase()
+}
+
+function normalizeWebhookConnectionStatus(value: unknown): ProviderConnectionStatus | null {
+  const current = String(value ?? '').trim().toLowerCase()
+  if (['connected', 'open', 'working', 'authenticated', 'ready'].includes(current)) return 'connected'
+  if (['connecting', 'pairing', 'starting', 'scan_qr_code', 'qrcode', 'qr_code', 'pending', 'hibernated'].includes(current)) {
+    return 'pending'
+  }
+  if (['disconnected', 'close', 'closed', 'offline', 'logged_out'].includes(current)) {
+    return 'disconnected'
+  }
+  if (['failed', 'error'].includes(current)) return 'error'
+  return null
+}
+
+function connectionWebhookPayload(provider: string, body: any) {
+  const event = normalizedWebhookEvent(body)
+  const normalizedProvider = String(provider ?? '').toLowerCase()
+  const connectionEvents: Record<string, string[]> = {
+    uazapi: ['connection', 'connection.update', 'connection_update'],
+    evolution: ['connection', 'connection.update', 'connection_update'],
+    waha: ['session.status', 'session_status', 'connection', 'connection.update', 'connection_update']
+  }
+  const allowedEvents = connectionEvents[normalizedProvider] ?? ['connection', 'connection.update', 'connection_update']
+
+  // Providers send many webhook types to the same URL. A message delivery can,
+  // for example, contain status=Failed; it must never change the session state.
+  if (event && !allowedEvents.includes(event)) {
+    return { ignored: true as const, reason: 'not_a_connection_event', event }
+  }
+
+  let rawStatus: unknown
+  let externalId: unknown
+
+  if (normalizedProvider === 'uazapi') {
+    rawStatus =
+      body.instance?.status ??
+      body.data?.instance?.status ??
+      body.payload?.instance?.status
+    externalId =
+      body.instance?.id ??
+      body.data?.instance?.id ??
+      body.payload?.instance?.id ??
+      body.instanceName ??
+      body.data?.instanceName ??
+      body.payload?.instanceName
+  } else if (normalizedProvider === 'evolution') {
+    rawStatus =
+      body.data?.state ??
+      body.instance?.state ??
+      body.payload?.state ??
+      body.data?.status ??
+      body.instance?.status
+    externalId =
+      (typeof body.instance === 'string' ? body.instance : body.instance?.name ?? body.instance?.id) ??
+      body.instanceName ??
+      body.data?.instance ??
+      body.data?.instanceName
+  } else {
+    rawStatus =
+      body.payload?.status ??
+      body.session?.status ??
+      body.data?.status
+    externalId =
+      (typeof body.session === 'string' ? body.session : body.session?.name ?? body.session?.id) ??
+      body.payload?.session ??
+      body.data?.session
+  }
+
+  // Some provider versions put connection status at the envelope root. Only
+  // accept that ambiguous field when the event explicitly says "connection".
+  if (event && allowedEvents.includes(event)) {
+    rawStatus ??= body.status
+    externalId ??=
+      (typeof body.instance === 'string' ? body.instance : body.instance?.name ?? body.instance?.id) ??
+      (typeof body.session === 'string' ? body.session : body.session?.name ?? body.session?.id)
+  }
+
+  const status = normalizeWebhookConnectionStatus(rawStatus)
+  if (!event && (!status || !externalId)) {
+    return { ignored: true as const, reason: 'ambiguous_webhook_without_connection_event', event }
+  }
+  if (!status) {
+    return {
+      ignored: true as const,
+      reason: 'unknown_connection_status',
+      event,
+      rawStatus: String(rawStatus ?? '')
+    }
+  }
+  if (!externalId) {
+    return { ignored: true as const, reason: 'missing_instance_identifier', event }
+  }
+  return {
+    ignored: false as const,
+    event,
+    externalId: String(externalId),
+    rawStatus: String(rawStatus),
+    status
+  }
 }
 
 router.get('/workspaces/me', requireAuth, async (req: AuthRequest, res) => {
@@ -116,8 +244,20 @@ router.post('/admin/customers', requireAuth, requireRole(['superadmin']), async 
     return res.status(400).json({ error: 'providers contains an invalid provider' })
   }
 
+  const billingPlan = planForIntegrationCount(providers.length)
+  const trialStartedAt = new Date()
+  const trialEndsAt = new Date(trialStartedAt.getTime() + 7 * 86_400_000)
   const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
-    email, password, email_confirm: true, user_metadata: { full_name }
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: {
+      full_name,
+      selected_plan: billingPlan.id,
+      subscription_status: 'trialing',
+      trial_started_at: trialStartedAt.toISOString(),
+      trial_ends_at: trialEndsAt.toISOString()
+    }
   })
   if (authError || !authData.user) return res.status(400).json({ error: authError?.message })
 
@@ -145,6 +285,16 @@ router.post('/admin/customers', requireAuth, requireRole(['superadmin']), async 
     )
     if (error) return res.status(500).json({ error: error.message })
   }
+  try {
+    await ensureWorkspaceSubscription({
+      workspaceId: workspace.id,
+      plan: billingPlan,
+      trialStartedAt: trialStartedAt.toISOString(),
+      trialEndsAt: trialEndsAt.toISOString()
+    })
+  } catch (billingError: any) {
+    return res.status(500).json({ error: `Não foi possível iniciar o teste grátis: ${billingError.message}` })
+  }
   await writeAuditLog({
     userId: req.currentUser!.id,
     workspaceId: workspace.id,
@@ -153,6 +303,25 @@ router.post('/admin/customers', requireAuth, requireRole(['superadmin']), async 
     entityId: workspace.id,
     metadata: { email, providers }
   })
+  try {
+    await sendEmail({
+      recipient: {
+        email,
+        name: full_name,
+        userId: authData.user.id,
+        workspaceId: workspace.id
+      },
+      category: 'platform',
+      templateKey: 'welcome',
+      idempotencyKey: `welcome:${authData.user.id}`,
+      variables: {
+        trialEndsAt: trialEndsAt.toLocaleString('pt-BR'),
+        dashboardUrl: process.env.APP_PUBLIC_URL || process.env.APP_ORIGIN
+      }
+    })
+  } catch (emailError: any) {
+    console.error('Provisioned customer welcome email failed:', emailError.message)
+  }
   res.status(201).json({ workspace, user: { id: authData.user.id, email, full_name }, providers })
 })
 
@@ -182,6 +351,7 @@ router.patch('/integrations/:integration_id/configure', requireAuth, requireRole
   if (!(await ensureWorkspaceAccess(req, integration.workspace_id))) {
     return res.status(403).json({ error: 'No access to this integration' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, integration.workspace_id))) return
   const { data, error } = await supabaseAdmin.from('integrations').update({
     base_url: base_url.replace(/\/+$/, ''),
     credentials: { apiKey: encryptSecret(api_key) },
@@ -204,6 +374,7 @@ router.post('/integrations/:integration_id/sync', requireAuth, async (req: AuthR
   if (!(await ensureWorkspaceAccess(req, integration.workspace_id))) {
     return res.status(403).json({ error: 'No access to this integration' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, integration.workspace_id))) return
   try {
     const instances = await syncIntegration(integration)
     res.json({ instances })
@@ -226,6 +397,7 @@ router.get('/workspace-numbers', requireAuth, async (req: AuthRequest, res) => {
 router.patch('/workspaces/:workspace_id/monitoring', requireAuth, requireRole(['workspace_admin', 'superadmin']), async (req: AuthRequest, res) => {
   const workspaceId = String(req.params.workspace_id)
   if (!(await ensureWorkspaceAccess(req, workspaceId))) return res.status(403).json({ error: 'No access to this workspace' })
+  if (!(await ensureWorkspaceOperationalAccess(req, res, workspaceId))) return
   const allowed = ['monitoring_enabled', 'auto_monitor_new_numbers', 'notify_whatsapp', 'notify_email', 'notify_on_reconnect']
   const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key)))
   const { data, error } = await supabaseAdmin.from('workspaces').update(updates)
@@ -242,11 +414,52 @@ router.patch('/numbers/:number_id/monitoring', requireAuth, requireRole(['worksp
   if (!workspaceId || !(await ensureWorkspaceAccess(req, workspaceId))) {
     return res.status(403).json({ error: 'No access to this number' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, workspaceId))) return
   const { data, error } = await supabaseAdmin.from('whatsapp_numbers')
     .update({ monitoring_enabled: Boolean(req.body.monitoring_enabled) })
     .eq('id', numberId).select('*').single()
   if (error) return res.status(500).json({ error: error.message })
   res.json({ number: data })
+})
+
+router.post('/numbers/:number_id/reconnect-authentication', requireAuth, requireRole(['workspace_admin', 'superadmin']), async (req: AuthRequest, res) => {
+  const numberId = String(req.params.number_id)
+  const method = String(req.body?.method || '')
+  if (!['qr', 'pairing'].includes(method)) {
+    return res.status(400).json({ error: 'method must be qr or pairing' })
+  }
+  const { data: number } = await supabaseAdmin.from('whatsapp_numbers')
+    .select('id, workspace_id')
+    .eq('id', numberId)
+    .single()
+  if (!number) return res.status(404).json({ error: 'Número não encontrado' })
+  if (!number.workspace_id || !(await ensureWorkspaceAccess(req, number.workspace_id))) {
+    return res.status(403).json({ error: 'Sem acesso a este número' })
+  }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, number.workspace_id))) return
+  try {
+    const result = await sendManualReconnectAuthentication(
+      numberId,
+      method as 'qr' | 'pairing'
+    )
+    await writeAuditLog({
+      userId: req.currentUser!.id,
+      workspaceId: number.workspace_id,
+      action: result.skipped
+        ? 'number.manual_reconnect_authentication_skipped'
+        : 'number.manual_reconnect_authentication_sent',
+      entityType: 'whatsapp_number',
+      entityId: numberId,
+      metadata: { method, reason: result.reason ?? null, status: result.status ?? null }
+    })
+    res.json({ result })
+  } catch (error: any) {
+    await insertEvent(numberId, 'manual_reconnect_authentication_failed', {
+      method,
+      error: error.message
+    })
+    res.status(502).json({ error: error.message })
+  }
 })
 
 router.get('/admin/notification-settings', requireAuth, requireRole(['superadmin']), async (_req, res) => {
@@ -301,6 +514,7 @@ router.patch('/workspaces/:workspace_id/notification-settings', requireAuth, req
   if (!(await ensureWorkspaceAccess(req, workspaceId))) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, workspaceId))) return
   const { primary_sender_id, fallback_sender_id } = req.body
   if (primary_sender_id && primary_sender_id === fallback_sender_id) {
     return res.status(400).json({ error: 'Primary and fallback senders must be different' })
@@ -344,24 +558,55 @@ router.post('/webhooks/providers/:integration_id', requireWebhookSecret, async (
       return res.status(502).json({ received: true, type: 'message', error: error.message })
     }
   }
-  const externalId = String(
-    (typeof body.instance === 'string' ? body.instance : body.instance?.name) ??
-    body.instanceName ?? body.session ?? body.data?.instance ?? ''
-  )
-  const rawStatus = body.payload?.status ?? body.data?.state ?? body.data?.status ?? body.status
-  if (!externalId || !rawStatus) return res.json({ received: true, ignored: true })
-  const normalized = ['connected', 'open', 'working'].includes(String(rawStatus).toLowerCase())
-    ? 'connected'
-    : ['connecting', 'starting', 'scan_qr_code'].includes(String(rawStatus).toLowerCase()) ? 'pending' : 'disconnected'
+  const connectionUpdate = connectionWebhookPayload(integration.provider, body)
+  if (connectionUpdate.ignored) {
+    return res.json({
+      received: true,
+      ignored: true,
+      reason: connectionUpdate.reason,
+      event: connectionUpdate.event
+    })
+  }
+  const { externalId, status: normalized, event, rawStatus } = connectionUpdate
   const { data: previous } = await supabaseAdmin.from('whatsapp_numbers').select('*')
     .eq('integration_id', integrationId).eq('external_id', externalId).single()
+  if (!previous) {
+    return res.json({ received: true, ignored: true, reason: 'instance_not_found', external_id: externalId })
+  }
+
+  const checkedAt = new Date().toISOString()
+  const confirmationThreshold = Math.max(1, Number(process.env.MONITOR_FAILURE_THRESHOLD || 2))
+  const disconnectGraceMs = Math.max(0, Number(process.env.DISCONNECT_GRACE_MS || 120_000))
+  let savedStatus: ProviderConnectionStatus = normalized
+  let consecutiveFailures = Number(previous.consecutive_failures || 0)
+
+  if (normalized === 'connected') {
+    consecutiveFailures = 0
+  } else if (normalized === 'pending') {
+    savedStatus = previous.status
+  } else if (previous.status === 'connected') {
+    consecutiveFailures += 1
+    const lastSeenAt = previous.last_seen_at ? new Date(previous.last_seen_at).getTime() : 0
+    const insideGraceWindow = lastSeenAt > 0 && Date.now() - lastSeenAt < disconnectGraceMs
+    if (consecutiveFailures < confirmationThreshold || insideGraceWindow) savedStatus = 'connected'
+  }
+
   const { data: number } = await supabaseAdmin.from('whatsapp_numbers').update({
-    status: normalized,
-    last_checked_at: new Date().toISOString(),
-    last_seen_at: normalized === 'connected' ? new Date().toISOString() : undefined
+    status: savedStatus,
+    consecutive_failures: consecutiveFailures,
+    last_checked_at: checkedAt,
+    last_seen_at: normalized === 'connected' ? checkedAt : previous.last_seen_at
   }).eq('integration_id', integrationId).eq('external_id', externalId).select('*').single()
   if (number) {
-    await insertEvent(number.id, 'provider_status_webhook', { provider: integration.provider, status: normalized })
+    await insertEvent(number.id, 'provider_status_webhook', {
+      provider: integration.provider,
+      event,
+      raw_status: rawStatus,
+      normalized_status: normalized,
+      saved_status: savedStatus,
+      consecutive_failures: consecutiveFailures,
+      disconnect_grace_ms: disconnectGraceMs
+    })
     if (previous && previous.status !== number.status) await processSyncedTransition(previous, number, integration)
   }
   res.json({ received: true, updated: Boolean(number) })
@@ -426,6 +671,7 @@ router.post('/clients/:client_id/numbers', requireAuth, requireRole(['workspace_
   if (!(await ensureWorkspaceAccess(req, client.workspace_id))) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, client.workspace_id))) return
 
   const { data, error } = await supabaseAdmin
     .from('whatsapp_numbers')
@@ -542,6 +788,7 @@ router.post('/clients', requireAuth, requireRole(['workspace_admin', 'superadmin
   if (!allowed) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, workspace_id))) return
 
   const { data, error } = await supabaseAdmin
     .from('clients')
@@ -613,6 +860,7 @@ router.patch('/clients/:client_id/integration', requireAuth, requireRole(['works
   if (!allowed) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, client.workspace_id))) return
 
   const { data, error } = await supabaseAdmin
     .from('clients')
@@ -658,6 +906,7 @@ router.get('/clients/:client_id/provider-status', requireAuth, requireRole(['wor
   if (!allowed) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, client.workspace_id))) return
 
   try {
     const status = await getProviderStatus(client)
@@ -689,6 +938,7 @@ router.post('/clients/:client_id/reconnect', requireAuth, requireRole(['workspac
   if (!allowed) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, client.workspace_id))) return
 
   const { data: number, error: numberError } = await supabaseAdmin
     .from('whatsapp_numbers')
@@ -732,6 +982,7 @@ router.post('/clients/:client_id/qr', requireAuth, requireRole(['workspace_admin
   if (!allowed) {
     return res.status(403).json({ error: 'No access to this workspace' })
   }
+  if (!(await ensureWorkspaceOperationalAccess(req, res, client.workspace_id))) return
 
   const { data: number, error: numberError } = await supabaseAdmin
     .from('whatsapp_numbers')
@@ -794,6 +1045,14 @@ router.post('/webhooks/disconnect', requireWebhookSecret, async (req, res) => {
   if (clientError || !client) {
     return res.status(404).json({ error: 'Client not found for this number' })
   }
+  const billingAccess = await workspaceBillingAccess(client.workspace_id)
+  if (!billingAccess.communications_allowed) {
+    await insertEvent(number.id, 'notification_suspended_billing', {
+      billing_state: billingAccess.state,
+      reason: billingAccess.reason
+    })
+    return res.json({ received: true, suspended: true, reason: 'billing_blocked' })
+  }
 
   try {
     const usePairing = shouldUsePairingCode(number, client)
@@ -838,6 +1097,10 @@ router.post('/webhooks/generate-qr', requireWebhookSecret, async (req, res) => {
 
   if (clientError || !client) {
     return res.status(404).json({ error: 'Client not found for this number' })
+  }
+  const billingAccess = await workspaceBillingAccess(client.workspace_id)
+  if (!billingAccess.communications_allowed) {
+    return res.json({ received: true, suspended: true, reason: 'billing_blocked' })
   }
 
   try {

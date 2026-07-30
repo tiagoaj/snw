@@ -1,11 +1,18 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import { randomUUID } from 'crypto'
 import { supabaseAdmin, supabase } from './lib/supabaseClient.js'
 import { requireAuth, requireRole, AuthRequest, ensureWorkspaceAccess } from './lib/auth.js'
 import routes from './lib/routes.js'
+import billingRoutes from './lib/billingRoutes.js'
+import emailRoutes from './lib/emailRoutes.js'
 import { startMonitoring } from './lib/monitoringService.js'
+import { startEmailCampaignWorker } from './lib/emailCampaignService.js'
+import { startEmailAutomationWorker } from './lib/emailAutomationService.js'
+import { sendEmail } from './lib/emailService.js'
 import { writeAuditLog } from './lib/auditService.js'
+import { ensureWorkspaceSubscription, planFromId } from './lib/billingService.js'
 
 dotenv.config()
 
@@ -26,12 +33,18 @@ app.use(cors({
     return callback(new Error('Origin not allowed by CORS'))
   }
 }))
-app.use(express.json())
+app.use(express.json({
+  verify(req: any, _res, buffer) {
+    req.rawBody = buffer.toString('utf8')
+  }
+}))
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' })
 })
 
+app.use('/api', billingRoutes)
+app.use('/api', emailRoutes)
 app.use('/api', routes)
 
 app.get('/', (_req, res) => {
@@ -39,13 +52,23 @@ app.get('/', (_req, res) => {
 })
 
 app.post('/api/auth/signup', async (req, res) => {
-  const { email, password, full_name, selected_plan } = req.body
+  const { email, password, full_name, company_name, selected_plan, providers = [] } = req.body
+  const selectedPlan = planFromId(selected_plan)
+  const allowedProviders = ['uazapi', 'evolution', 'waha']
 
-  if (!email || !password || !full_name) {
-    return res.status(400).json({ error: 'email, password and full_name are required' })
+  if (!email || !password || !full_name || !company_name) {
+    return res.status(400).json({ error: 'email, password, full_name and company_name are required' })
   }
-  if (selected_plan && !['start', 'growth', 'scale'].includes(String(selected_plan))) {
+  if (!selectedPlan) {
     return res.status(400).json({ error: 'selected_plan is invalid' })
+  }
+  if (!Array.isArray(providers) ||
+    providers.length !== selectedPlan.integrationLimit ||
+    providers.some((provider) => !allowedProviders.includes(String(provider))) ||
+    new Set(providers).size !== providers.length) {
+    return res.status(400).json({
+      error: `Selecione exatamente ${selectedPlan.integrationLimit} integração(ões) diferentes para este plano`
+    })
   }
 
   const { data: existingUser, error: existingError } = await supabaseAdmin
@@ -62,13 +85,19 @@ app.post('/api/auth/signup', async (req, res) => {
     return res.status(400).json({ error: 'A user with this email already exists' })
   }
 
+  const trialStartedAt = new Date()
+  const trialEndsAt = new Date(trialStartedAt.getTime() + 7 * 86_400_000)
   const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
     email,
     password,
     email_confirm: true,
     user_metadata: {
       full_name,
-      selected_plan: selected_plan || null
+      company_name,
+      selected_plan: selectedPlan.id,
+      subscription_status: 'trialing',
+      trial_started_at: trialStartedAt.toISOString(),
+      trial_ends_at: trialEndsAt.toISOString()
     }
   })
 
@@ -96,7 +125,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
   const isFirstSuperadmin = !selectedSuperadmin
   const role = isFirstSuperadmin ? 'superadmin' : 'client_user'
-  const status = isFirstSuperadmin ? 'active' : 'pending'
+  const status = 'active'
 
   const { error: insertError } = await supabaseAdmin.from('users').insert([
     {
@@ -109,10 +138,107 @@ app.post('/api/auth/signup', async (req, res) => {
   ])
 
   if (insertError) {
+    await supabaseAdmin.auth.admin.deleteUser(user_id)
     return res.status(500).json({ error: insertError.message })
   }
 
-  res.status(201).json({ user, role, status, selected_plan: selected_plan || null })
+  if (isFirstSuperadmin) {
+    return res.status(201).json({
+      user,
+      role,
+      status,
+      selected_plan: selectedPlan.id,
+      workspace: null
+    })
+  }
+
+  const slugBase = String(company_name)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 48) || 'workspace'
+  const workspaceSlug = `${slugBase}-${randomUUID().slice(0, 6)}`
+  const { data: workspace, error: workspaceError } = await supabaseAdmin
+    .from('workspaces')
+    .insert([{ name: String(company_name).trim(), slug: workspaceSlug }])
+    .select('*')
+    .single()
+  if (workspaceError || !workspace) {
+    await supabaseAdmin.from('users').delete().eq('id', user_id)
+    await supabaseAdmin.auth.admin.deleteUser(user_id)
+    return res.status(500).json({ error: workspaceError?.message || 'Unable to create workspace' })
+  }
+
+  const { error: profileError } = await supabaseAdmin.from('user_profiles').insert([{
+    user_id,
+    workspace_id: workspace.id,
+    role: 'workspace_admin'
+  }])
+  const { error: integrationsError } = await supabaseAdmin.from('integrations').insert(
+    providers.map((provider: string) => ({
+      workspace_id: workspace.id,
+      provider,
+      name: provider.toUpperCase()
+    }))
+  )
+  if (profileError || integrationsError) {
+    await supabaseAdmin.from('workspaces').delete().eq('id', workspace.id)
+    await supabaseAdmin.from('users').delete().eq('id', user_id)
+    await supabaseAdmin.auth.admin.deleteUser(user_id)
+    return res.status(500).json({ error: profileError?.message || integrationsError?.message })
+  }
+
+  try {
+    await ensureWorkspaceSubscription({
+      workspaceId: workspace.id,
+      plan: selectedPlan,
+      trialStartedAt: trialStartedAt.toISOString(),
+      trialEndsAt: trialEndsAt.toISOString()
+    })
+  } catch (billingError: any) {
+    return res.status(500).json({ error: `Não foi possível iniciar o teste grátis: ${billingError.message}` })
+  }
+
+  await writeAuditLog({
+    userId: user_id,
+    workspaceId: workspace.id,
+    action: 'customer.self_registered',
+    entityType: 'workspace',
+    entityId: workspace.id,
+    metadata: { plan_id: selectedPlan.id, providers }
+  })
+
+  try {
+    await sendEmail({
+      recipient: {
+        email,
+        name: full_name,
+        userId: user_id,
+        workspaceId: workspace.id
+      },
+      category: 'platform',
+      templateKey: 'welcome',
+      idempotencyKey: `welcome:${user_id}`,
+      variables: {
+        trialEndsAt: trialEndsAt.toLocaleString('pt-BR'),
+        dashboardUrl: process.env.APP_PUBLIC_URL || process.env.APP_ORIGIN
+      }
+    })
+  } catch (emailError: any) {
+    console.error('Welcome email failed:', emailError.message)
+  }
+
+  res.status(201).json({
+    user,
+    role,
+    status,
+    selected_plan: selectedPlan.id,
+    workspace,
+    providers,
+    trial_ends_at: trialEndsAt.toISOString()
+  })
 })
 
 app.post('/api/auth/login', async (req, res) => {
@@ -151,6 +277,35 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   res.json({ session: data.session, user: data.user })
+})
+
+app.post('/api/auth/refresh', async (req, res) => {
+  const refreshToken = String(req.body?.refresh_token || '')
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'refresh_token is required' })
+  }
+  const { data, error } = await supabase.auth.refreshSession({
+    refresh_token: refreshToken
+  })
+  if (error || !data.session) {
+    return res.status(401).json({ error: error?.message || 'Unable to refresh session' })
+  }
+  res.json({ session: data.session })
+})
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase()
+  if (!email) return res.status(400).json({ error: 'Informe o e-mail da conta' })
+  const redirectBase = (process.env.APP_PUBLIC_URL || process.env.APP_ORIGIN || '')
+    .split(',')[0]
+    .replace(/\/+$/, '')
+  if (!redirectBase) return res.status(503).json({ error: 'APP_PUBLIC_URL não está configurada' })
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: redirectBase
+  })
+  if (error) console.error('Password recovery request failed:', error.message)
+  // Resposta deliberadamente neutra para não revelar quais e-mails possuem conta.
+  res.json({ success: true, message: 'Se este e-mail estiver cadastrado, enviaremos o link de recuperação.' })
 })
 
 app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
@@ -259,5 +414,14 @@ app.post('/api/users/approve', requireAuth, requireRole(['superadmin']), async (
 
 app.listen(port, () => {
   console.log(`Backend rodando em http://localhost:${port}`)
-  startMonitoring()
+  const backgroundWorkersEnabled = !['false', '0', 'off'].includes(
+    String(process.env.BACKGROUND_WORKERS_ENABLED ?? 'true').toLowerCase()
+  )
+  if (backgroundWorkersEnabled) {
+    startMonitoring()
+    startEmailCampaignWorker()
+    startEmailAutomationWorker()
+  } else {
+    console.log('Workers automáticos desativados neste ambiente')
+  }
 })

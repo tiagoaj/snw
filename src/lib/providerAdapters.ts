@@ -61,9 +61,17 @@ function deepValue(value: any, paths: string[]): any {
 function normalizeStatus(value: unknown): NumberStatus {
   const status = String(value ?? '').toLowerCase()
   if (['connected', 'open', 'working', 'authenticated', 'ready'].includes(status)) return 'connected'
-  if (['connecting', 'pairing', 'qrcode', 'qr_code', 'scan_qr_code', 'starting', 'pending'].includes(status)) return 'pending'
+  if (['connecting', 'pairing', 'qrcode', 'qr_code', 'scan_qr_code', 'starting', 'pending', 'hibernated'].includes(status)) {
+    return 'pending'
+  }
   if (['failed', 'error'].includes(status)) return 'error'
-  return 'disconnected'
+  if (['disconnected', 'close', 'closed', 'offline', 'logged_out'].includes(status)) {
+    return 'disconnected'
+  }
+  // A response without a recognized connection status does not prove that the
+  // WhatsApp session dropped. Keeping it pending prevents unrelated provider
+  // payloads from becoming false disconnects.
+  return 'pending'
 }
 
 function normalize(provider: ProviderPlatform, raw: any): NormalizedProviderResult {
@@ -72,8 +80,24 @@ function normalize(provider: ProviderPlatform, raw: any): NormalizedProviderResu
     evolution: ['instance.state', 'state', 'status'],
     waha: ['status']
   }
-  const qrPaths = ['base64', 'qrcode.base64', 'qrcode', 'qrCode', 'qr', 'data.qr']
-  const pairingPaths = ['pairingCode', 'pairing_code', 'paircode', 'instance.paircode', 'code']
+  const qrPaths = [
+    'base64',
+    'instance.qrcode',
+    'instance.qrCode',
+    'qrcode.base64',
+    'qrcode',
+    'qrCode',
+    'qr',
+    'data.qr'
+  ]
+  const pairingPaths = [
+    'pairingCode',
+    'pairing_code',
+    'paircode',
+    'instance.paircode',
+    'instance.pairingCode',
+    'code'
+  ]
   return {
     provider,
     status: normalizeStatus(deepValue(raw, statusPaths[provider])),
@@ -160,10 +184,32 @@ async function callProvider(
 export const getProviderStatus = (client: any) => callProvider(client, 'status')
 export const requestProviderReconnect = (client: any, number: any) =>
   callProvider(client, 'reconnect', { phone: number.phone })
-export const requestProviderQr = (client: any, number: any) =>
-  callProvider(client, 'qr', { phone: number.phone })
-export const requestProviderPairing = (client: any, number: any) =>
-  callProvider(client, 'pairing', { phone: number.phone })
+async function waitForUazapiAuthentication(
+  client: any,
+  initial: NormalizedProviderResult,
+  expected: 'qr' | 'pairing'
+) {
+  if (client.integration_platform !== 'uazapi') return initial
+  if (expected === 'qr' ? initial.qrCode : initial.pairingCode) return initial
+
+  let latest = initial
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 500 : 1000))
+    latest = await callProvider(client, 'status')
+    if (expected === 'qr' ? latest.qrCode : latest.pairingCode) return latest
+  }
+  return latest
+}
+
+export async function requestProviderQr(client: any, number: any) {
+  const initial = await callProvider(client, 'qr', { phone: number.phone })
+  return waitForUazapiAuthentication(client, initial, 'qr')
+}
+
+export async function requestProviderPairing(client: any, number: any) {
+  const initial = await callProvider(client, 'pairing', { phone: number.phone })
+  return waitForUazapiAuthentication(client, initial, 'pairing')
+}
 
 export async function sendProviderNotification(
   client: any,

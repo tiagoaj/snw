@@ -1,6 +1,8 @@
 import { supabaseAdmin } from './supabaseClient.js'
 import { insertEvent } from './whatsappService.js'
 import { sendProviderNotification } from './providerAdapters.js'
+import { workspaceBillingAccess } from './billingAccessService.js'
+import { sendEmail } from './emailService.js'
 
 type Notification = {
   to: string
@@ -8,41 +10,6 @@ type Notification = {
   message: string
   qr_code?: string | null
   pair_code?: string | null
-}
-
-async function sendEmail(notification: Notification, client: any) {
-  const apiKey = process.env.RESEND_API_KEY
-  const from = process.env.NOTIFICATION_EMAIL_FROM
-  if (!apiKey || !from) {
-    throw new Error('Email delivery requires RESEND_API_KEY and NOTIFICATION_EMAIL_FROM')
-  }
-
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      from,
-      to: [notification.to],
-      subject: `WhatsApp desconectado — ${client.name}`,
-      html: `<h2>WhatsApp desconectado</h2><p>${notification.message}</p>${
-        notification.qr_code
-          ? `<p>O QR Code para reconexão está anexado a este e-mail.</p>`
-          : ''
-      }`,
-      attachments: notification.qr_code
-        ? [{
-            filename: 'qrcode.png',
-            content: notification.qr_code.replace(/^data:image\/\w+;base64,/, '')
-          }]
-        : undefined
-    })
-  })
-  const body = await response.text()
-  if (!response.ok) throw new Error(`Email delivery failed with HTTP ${response.status}: ${body}`)
-  return JSON.parse(body)
 }
 
 async function findWhatsappSender(disconnectedNumberId: string, workspaceId: string) {
@@ -79,10 +46,32 @@ export async function deliverNotification(
   notification: Notification
 ) {
   try {
+    const billingAccess = await workspaceBillingAccess(client.workspace_id)
+    if (!billingAccess.communications_allowed) {
+      await insertEvent(disconnectedNumber.id, 'notification_suspended_billing', {
+        billing_state: billingAccess.state,
+        reason: billingAccess.reason
+      })
+      return { delivered: false, suspended: true, error: 'Workspace suspended due to billing status' }
+    }
     let providerResponse: unknown
     let senderNumber: string | null = null
     if (notification.channel === 'email') {
-      providerResponse = await sendEmail(notification, client)
+      providerResponse = await sendEmail({
+        recipient: { email: notification.to, workspaceId: client.workspace_id },
+        category: 'status',
+        templateKey: 'status_disconnected',
+        variables: {
+          numberName: client.name,
+          dashboardUrl: process.env.APP_PUBLIC_URL || process.env.APP_ORIGIN
+        },
+        attachments: notification.qr_code
+          ? [{
+              filename: 'qrcode.png',
+              content: notification.qr_code.replace(/^data:image\/\w+;base64,/, '')
+            }]
+          : undefined
+      })
     } else {
       const sender = await findWhatsappSender(disconnectedNumber.id, client.workspace_id)
       senderNumber = sender.number.phone

@@ -7,18 +7,28 @@ services:
       NODE_ENV: production
       PORT: 4000
       APP_ORIGIN: ${APP_ORIGIN:-https://snw.fluinow.com.br}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-https://snw.fluinow.com.br}
       SUPABASE_URL: ${SUPABASE_URL}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      ASAAS_ENVIRONMENT: ${ASAAS_ENVIRONMENT:-sandbox}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       NOTIFICATION_EMAIL_FROM: ${NOTIFICATION_EMAIL_FROM:-SNW <alertas@fluinow.com.br>}
+      RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
+      EMAIL_UNSUBSCRIBE_SECRET: ${EMAIL_UNSUBSCRIBE_SECRET:-}
+      EMAIL_CAMPAIGN_INTERVAL_MS: ${EMAIL_CAMPAIGN_INTERVAL_MS:-60000}
+      EMAIL_AUTOMATION_INTERVAL_MS: ${EMAIL_AUTOMATION_INTERVAL_MS:-900000}
       MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-60000}
       MONITOR_FAILURE_THRESHOLD: ${MONITOR_FAILURE_THRESHOLD:-2}
+      DISCONNECT_GRACE_MS: ${DISCONNECT_GRACE_MS:-120000}
+      BACKGROUND_WORKERS_ENABLED: ${BACKGROUND_WORKERS_ENABLED:-true}
       ALERT_COOLDOWN_MS: ${ALERT_COOLDOWN_MS:-300000}
       RECONNECT_REQUEST_TTL_MS: ${RECONNECT_REQUEST_TTL_MS:-900000}
     secrets:
       - snw_supabase_service_role_key
       - snw_webhook_secret
       - snw_integration_encryption_key
+      - snw_asaas_api_key
+      - snw_asaas_webhook_token
     networks:
       - snw-internal
     healthcheck:
@@ -104,4 +114,8 @@ secrets:
   snw_webhook_secret:
     external: true
   snw_integration_encryption_key:
+    external: true
+  snw_asaas_api_key:
+    external: true
+  snw_asaas_webhook_token:
     external: true
